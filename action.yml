@@ -1,0 +1,163 @@
+name: 'Unified Versioning Action'
+description: 'Calculates the next version for Git tags or GHCR images using different strategies.'
+author: 'A.Belkhiria'
+
+# Define the inputs the user will provide
+inputs:
+  mode:
+    description: 'The versioning mode to use. Options: git-calver, ghcr-calver, git-semver.'
+    required: true
+  ghcr-package-name:
+    description: 'The full name of the package in GHCR (e.g., your-org/your-app). Required for ghcr-calver mode.'
+    required: false
+  calver-reset-policy:
+    description: 'For calver modes, defines if the build number resets. Options: monthly, continuous.'
+    required: false
+    default: 'monthly'
+  semver-increment:
+    description: 'Which part of the version to increment for git-semver mode. Options: major, minor, patch.'
+    required: false
+    default: 'patch'
+  use-pr-labels:
+    description: 'If true, determines semver-increment from PR labels (release:major, release:minor). Requires mode to be git-semver.'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'GitHub token for authenticating to GHCR.'
+    required: false
+    default: ${{ github.token }}
+  initial-version:
+    description: 'The version to use if no previous tags are found.'
+    required: false
+    default: '0.0.0'
+  override-version:
+    description: 'A specific version to use as the base for calculation, overriding auto-detection from Git or GHCR.'
+    required: false
+
+# Define the outputs the action will produce
+outputs:
+  new-version:
+    description: "The calculated new version string."
+    value: ${{ steps.calculate.outputs.new-version }}
+  previous-version:
+    description: "The latest version that was detected before incrementing."
+    value: ${{ steps.calculate.outputs.previous-version }}
+    
+runs:
+  using: "composite"
+  steps:
+    # Step 1: Install dependencies if needed
+    - name: Install Dependencies
+      if: inputs.mode == 'ghcr-calver' || inputs.use-pr-labels == 'true'
+      shell: bash
+      run: |
+        echo "Installing dependencies..."
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    # Step 2: Log in to GHCR only if needed
+    - name: Log in to GitHub Container Registry
+      if: inputs.mode == 'ghcr-calver'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.github-token }}
+
+    # Step 3: The main logic to calculate the version
+    - name: Calculate New Version
+      id: calculate
+      shell: bash
+      run: |
+        set -e # Exit immediately if a command exits with a non-zero status.
+
+        # --- SHARED VARIABLES ---
+        LATEST_TAG=""
+        NEW_VERSION=""
+        INITIAL_VERSION="${{ inputs.initial-version }}"
+        OVERRIDE_VERSION="${{ inputs.override-version }}"
+        SEMVER_INCREMENT="${{ inputs.semver-increment }}"
+
+        # --- Determine SemVer increment from PR labels if enabled ---
+        if [[ "${{ inputs.use-pr-labels }}" == "true" && "${{ inputs.mode }}" == "git-semver" ]]; then
+          echo "Checking PR labels for SemVer increment..."
+          if [[ -z "$GITHUB_EVENT_PATH" || $(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH") == "null" ]]; then
+            echo "Warning: 'use-pr-labels' is true, but this is not a pull_request event. Using default increment."
+          else
+            LABELS=$(jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH")
+            if echo "$LABELS" | grep -q "release:major"; then
+              echo "Found 'release:major' label. Setting increment to major."
+              SEMVER_INCREMENT="major"
+            elif echo "$LABELS" | grep -q "release:minor"; then
+              echo "Found 'release:minor' label. Setting increment to minor."
+              SEMVER_INCREMENT="minor"
+            else
+              echo "No release labels found on PR. Defaulting to '${SEMVER_INCREMENT}'."
+            fi
+          fi
+        fi
+
+        # --- Determine LATEST_TAG ---
+        if [[ -n "$OVERRIDE_VERSION" ]]; then
+          echo "Using override version as the base: $OVERRIDE_VERSION"
+          LATEST_TAG="$OVERRIDE_VERSION"
+        else
+          echo "Auto-detecting latest version from source..."
+          if [[ "${{ inputs.mode }}" == "git-calver" || "${{ inputs.mode }}" == "git-semver" ]]; then
+            git config --global --add safe.directory ${{ github.workspace }}
+            LATEST_TAG=$(git tag --sort=-version:refname | head -n 1)
+          elif [[ "${{ inputs.mode }}" == "ghcr-calver" ]]; then
+            PACKAGE="${{ inputs.ghcr-package-name }}"
+            if [[ -z "$PACKAGE" ]]; then echo "Error: ghcr-package-name is required for this mode."; exit 1; fi
+            LATEST_TAG=$(skopeo list-tags "docker://ghcr.io/${PACKAGE}" | jq -r '.Tags[] | select(. != "latest")' | sort -V | tail -n 1)
+          fi
+          
+          if [[ -z "$LATEST_TAG" ]]; then
+            echo "No existing tags found. Using initial version as base."
+            LATEST_TAG="$INITIAL_VERSION"
+          fi
+        fi
+        
+        echo "Determined base version: $LATEST_TAG"
+
+        # --- Calculate NEW_VERSION based on mode ---
+        if [[ "${{ inputs.mode }}" == "git-calver" || "${{ inputs.mode }}" == "ghcr-calver" ]]; then
+          echo "Calculating next CalVer version..."
+          current_date=$(date +'%y.%-m')
+          tag_date=$(echo "$LATEST_TAG" | cut -d. -f1,2)
+          
+          if [[ "$current_date" == "$tag_date" && "${{ inputs.calver-reset-policy }}" == "monthly" ]]; then
+            build_number=$(echo "$LATEST_TAG" | cut -d. -f3)
+            new_build_number=$((build_number + 1))
+            NEW_VERSION="$current_date.$new_build_number"
+          else
+            NEW_VERSION="$current_date.1"
+          fi
+
+        elif [[ "${{ inputs.mode }}" == "git-semver" ]]; then
+          echo "Calculating next SemVer version with increment: ${SEMVER_INCREMENT}"
+          if [[ $LATEST_TAG =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              major=${BASH_REMATCH[1]}
+              minor=${BASH_REMATCH[2]}
+              patch=${BASH_REMATCH[3]}
+              
+              case "$SEMVER_INCREMENT" in
+                  major) new_major=$((major + 1)); new_minor=0; new_patch=0;;
+                  minor) new_major=$major; new_minor=$((minor + 1)); new_patch=0;;
+                  *) new_major=$major; new_minor=$minor; new_patch=$((patch + 1));;
+              esac
+              NEW_VERSION="$new_major.$new_minor.$new_patch"
+          else
+              echo "Error: Base version '$LATEST_TAG' is not a valid SemVer string (e.g., 1.2.3)."
+              exit 1
+          fi
+
+        else
+          echo "Error: Invalid mode '${{ inputs.mode }}' selected."
+          exit 1
+        fi
+
+        echo "Previous Version: $LATEST_TAG"
+        echo "New Version: $NEW_VERSION"
+        echo "previous-version=$LATEST_TAG" >> $GITHUB_OUTPUT
+        echo "new-version=$NEW_VERSION" >> $GITHUB_OUTPUT
